@@ -75,12 +75,11 @@ def _cache_path(url: str) -> Path:
 
 
 def _fetch(url: str, use_cache: bool = True) -> BeautifulSoup:
-    """Fetch URL with rate limiting, retry, caching, and auto encoding.
+    """Fetch URL using Playwright (headless browser) with caching.
 
-    Uses curl for HTTP requests (more reliable cookie handling than requests library).
+    netkeiba.com uses JavaScript to load race data dynamically,
+    so a headless browser is required to render the full page.
     """
-    import subprocess
-
     if use_cache:
         cache = _cache_path(url)
         if cache.exists():
@@ -91,34 +90,7 @@ def _fetch(url: str, use_cache: bool = True) -> BeautifulSoup:
     for attempt in range(_MAX_RETRIES):
         try:
             time.sleep(REQUEST_INTERVAL_SEC)
-
-            cmd = [
-                "curl", "-s", "-L", "--max-time", "30",
-                "-H", f"User-Agent: {_SESSION.headers['User-Agent']}",
-                "-H", "Accept-Language: ja,en-US;q=0.9,en;q=0.8",
-            ]
-            if _COOKIE_STRING:
-                cmd.extend(["-b", _COOKIE_STRING])
-            cmd.append(url)
-
-            result = subprocess.run(cmd, capture_output=True, timeout=35)
-            if result.returncode != 0:
-                raise RuntimeError(f"curl exit code {result.returncode}")
-
-            raw = result.stdout
-
-            # Detect encoding
-            html = ""
-            for encoding in ["utf-8", "euc-jp", "shift_jis"]:
-                try:
-                    html = raw.decode(encoding)
-                    if "html" in html.lower() or "レース" in html or "netkeiba" in html:
-                        break
-                except (UnicodeDecodeError, ValueError):
-                    continue
-
-            if not html:
-                html = raw.decode("utf-8", errors="replace")
+            html = _fetch_with_playwright(url)
 
             if use_cache and html:
                 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,6 +105,61 @@ def _fetch(url: str, use_cache: bool = True) -> BeautifulSoup:
             time.sleep(wait)
 
     raise RuntimeError(f"Failed after {_MAX_RETRIES} retries: {url}: {last_error}")
+
+
+_BROWSER = None
+_CONTEXT = None
+
+
+def _get_browser_context():
+    """Get or create a persistent Playwright browser context with cookies."""
+    global _BROWSER, _CONTEXT
+    if _CONTEXT is not None:
+        return _CONTEXT
+
+    from playwright.sync_api import sync_playwright
+
+    pw = sync_playwright().start()
+    _BROWSER = pw.chromium.launch(headless=True)
+
+    # Set up context with cookies
+    _CONTEXT = _BROWSER.new_context(
+        user_agent=_SESSION.headers["User-Agent"],
+        locale="ja-JP",
+    )
+
+    # Load cookies from cookie string
+    if _COOKIE_STRING:
+        cookies = []
+        for pair in _COOKIE_STRING.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                key, val = pair.split("=", 1)
+                cookies.append({
+                    "name": key.strip(),
+                    "value": val.strip(),
+                    "domain": ".netkeiba.com",
+                    "path": "/",
+                })
+        if cookies:
+            _CONTEXT.add_cookies(cookies)
+            logger.info(f"Loaded {len(cookies)} cookies into browser")
+
+    return _CONTEXT
+
+
+def _fetch_with_playwright(url: str) -> str:
+    """Fetch a fully rendered page using Playwright."""
+    context = _get_browser_context()
+    page = context.new_page()
+    try:
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        # Wait for race result table to appear
+        page.wait_for_timeout(2000)
+        html = page.content()
+        return html
+    finally:
+        page.close()
 
 
 # ---------------------------------------------------------------------------

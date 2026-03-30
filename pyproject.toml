@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keiba"
+version = "0.1.0"
+description = "AI-powered Japanese horse racing prediction system"
+requires-python = ">=3.11"
+
+dependencies = [
+    "sqlalchemy>=2.0",
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "lightgbm>=4.0",
+    "scikit-learn>=1.4",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "python-dotenv>=1.0",
+    "click>=8.1",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+[project.scripts]
+keiba = "keiba.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

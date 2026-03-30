@@ -82,14 +82,20 @@ def _fetch(url: str, use_cache: bool = True) -> BeautifulSoup:
             html = cache.read_text(encoding="utf-8")
             return BeautifulSoup(html, "lxml")
 
+    # Build headers (avoid Session cookie jar interference)
+    headers = dict(_SESSION.headers)
+    if _COOKIE_STRING:
+        headers["Cookie"] = _COOKIE_STRING
+
     last_error = None
     for attempt in range(_MAX_RETRIES):
         try:
             time.sleep(REQUEST_INTERVAL_SEC)
-            resp = _SESSION.get(url, timeout=30)
+            # Use requests.get directly instead of Session to avoid cookie jar conflicts
+            resp = requests.get(url, headers=headers, timeout=30)
             resp.raise_for_status()
 
-            # Auto-detect encoding: netkeiba uses EUC-JP on db.*, UTF-8 on race.*
+            # Auto-detect encoding
             if resp.apparent_encoding:
                 resp.encoding = resp.apparent_encoding
             elif "db.netkeiba" in url:

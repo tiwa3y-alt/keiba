@@ -25,6 +25,9 @@ env/
 # Jupyter Notebook
 .ipynb_checkpoints/
 
+# Database
+*.db
+
 # Data files (large datasets)
 data/raw/
 data/external/

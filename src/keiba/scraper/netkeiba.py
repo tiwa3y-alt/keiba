@@ -1,4 +1,8 @@
-"""Scraper for netkeiba.com - race results, horse profiles, odds, and payouts."""
+"""Scraper for netkeiba.com - race results, horse profiles, odds, and payouts.
+
+Uses db.netkeiba.com as primary data source (most stable URL format).
+Encoding auto-detection: EUC-JP or UTF-8.
+"""
 
 import hashlib
 import logging
@@ -10,11 +14,15 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-from keiba.config import NETKEIBA_BASE_URL, NETKEIBA_DB_URL, REQUEST_INTERVAL_SEC
+from keiba.config import REQUEST_INTERVAL_SEC
 from keiba.db.connection import get_session, init_db
-from keiba.db.schema import Horse, OddsHistory, Payout, Race, RaceResult
+from keiba.db.schema import Horse, Payout, Race, RaceResult
 
 logger = logging.getLogger(__name__)
+
+# URLs
+DB_BASE = "https://db.netkeiba.com"
+RACE_BASE = "https://race.netkeiba.com"
 
 # Raw HTML cache directory
 _CACHE_DIR = Path("data/raw")
@@ -23,9 +31,10 @@ _SESSION = requests.Session()
 _SESSION.headers.update(
     {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
     }
 )
 
@@ -34,76 +43,64 @@ _RETRY_BACKOFF = [2, 5, 10]
 
 
 def _cache_path(url: str) -> Path:
-    """Get cache file path for a URL."""
     url_hash = hashlib.md5(url.encode()).hexdigest()
     return _CACHE_DIR / f"{url_hash}.html"
 
 
 def _fetch(url: str, use_cache: bool = True) -> BeautifulSoup:
-    """Fetch a URL with rate limiting, retry, and caching.
-
-    Args:
-        url: URL to fetch.
-        use_cache: If True, check/store raw HTML cache.
-
-    Returns:
-        Parsed BeautifulSoup object.
-    """
-    # Check cache first
+    """Fetch URL with rate limiting, retry, caching, and auto encoding."""
     if use_cache:
         cache = _cache_path(url)
         if cache.exists():
             html = cache.read_text(encoding="utf-8")
             return BeautifulSoup(html, "lxml")
 
-    # Fetch with retry
     last_error = None
     for attempt in range(_MAX_RETRIES):
         try:
             time.sleep(REQUEST_INTERVAL_SEC)
             resp = _SESSION.get(url, timeout=30)
-            resp.encoding = "EUC-JP"
             resp.raise_for_status()
+
+            # Auto-detect encoding: netkeiba uses EUC-JP on db.*, UTF-8 on race.*
+            if resp.apparent_encoding:
+                resp.encoding = resp.apparent_encoding
+            elif "db.netkeiba" in url:
+                resp.encoding = "EUC-JP"
+            else:
+                resp.encoding = "UTF-8"
 
             html = resp.text
 
-            # Save to cache
             if use_cache:
                 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                cache = _cache_path(url)
-                cache.write_text(html, encoding="utf-8")
+                _cache_path(url).write_text(html, encoding="utf-8")
 
             return BeautifulSoup(html, "lxml")
 
         except requests.RequestException as e:
             last_error = e
-            wait = _RETRY_BACKOFF[attempt] if attempt < len(_RETRY_BACKOFF) else 10
-            logger.warning(f"Retry {attempt + 1}/{_MAX_RETRIES} for {url}: {e} (wait {wait}s)")
+            wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+            logger.warning(f"Retry {attempt + 1}/{_MAX_RETRIES} for {url}: {e}")
             time.sleep(wait)
 
-    raise RuntimeError(f"Failed to fetch {url} after {_MAX_RETRIES} retries: {last_error}")
+    raise RuntimeError(f"Failed after {_MAX_RETRIES} retries: {url}: {last_error}")
 
+
+# ---------------------------------------------------------------------------
+# Utility parsers
+# ---------------------------------------------------------------------------
 
 def _parse_time_to_seconds(time_str: str) -> float | None:
-    """Convert "1:34.5" or "1.34.5" format to seconds.
-
-    Examples:
-        "1:34.5" -> 94.5 (1 min 34.5 sec)
-        "1.34.5" -> 94.5 (netkeiba variant)
-        "34.5"   -> 34.5 (seconds only)
-    """
     if not time_str or time_str.strip() in ("", "-"):
         return None
     time_str = time_str.strip()
-    # Handle "M:SS.s" format
     m = re.match(r"^(\d+):(\d+\.?\d*)$", time_str)
     if m:
         return float(m.group(1)) * 60 + float(m.group(2))
-    # Handle "M.SS.s" format (netkeiba uses this sometimes)
     m = re.match(r"^(\d+)\.(\d{2}\.\d+)$", time_str)
     if m:
         return float(m.group(1)) * 60 + float(m.group(2))
-    # Handle seconds-only "SS.s"
     try:
         return float(time_str)
     except ValueError:
@@ -111,7 +108,6 @@ def _parse_time_to_seconds(time_str: str) -> float | None:
 
 
 def _safe_int(val: str) -> int | None:
-    """Safely parse integer from string."""
     try:
         return int(re.sub(r"[^\d\-]", "", val))
     except (ValueError, TypeError):
@@ -119,62 +115,44 @@ def _safe_int(val: str) -> int | None:
 
 
 def _safe_float(val: str) -> float | None:
-    """Safely parse float from string."""
     try:
         return float(re.sub(r"[^\d.\-]", "", val))
     except (ValueError, TypeError):
         return None
 
 
+VENUE_CODES = {
+    "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+    "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉",
+}
+
+
 # ---------------------------------------------------------------------------
-# Race list scraping
+# Race list: use db.netkeiba.com/race/list/ (most reliable)
 # ---------------------------------------------------------------------------
-
-
-def scrape_grade_race_list(year: int) -> list[str]:
-    """Get list of grade race IDs for a given year.
-
-    Scrapes the netkeiba grade race calendar page.
-
-    Returns:
-        List of race_id strings like "202405050811".
-    """
-    url = f"{NETKEIBA_BASE_URL}/top/race_list.html?kaisai_date={year}"
-    soup = _fetch(url)
-    race_ids = []
-    for a_tag in soup.select("a[href*='/race/']"):
-        href = a_tag.get("href", "")
-        match = re.search(r"/race/(\d{12})", href)
-        if match:
-            race_id = match.group(1)
-            if race_id not in race_ids:
-                race_ids.append(race_id)
-    return race_ids
-
 
 def scrape_grade_race_list_by_search(year: int) -> list[str]:
-    """Get grade race IDs via the netkeiba search interface.
+    """Get grade race IDs using db.netkeiba.com search.
 
-    Uses the race search to find G1/G2/G3 races for the given year.
-    This is more reliable than the calendar-based approach.
-
-    Returns:
-        List of race_id strings.
+    Tries multiple URL patterns for robustness.
     """
     race_ids = []
-    for grade_code in [1, 2, 3]:  # G1=1, G2=2, G3=3
+
+    for grade_code in [1, 2, 3]:  # G1, G2, G3
         page = 1
         while True:
+            # Primary: pid=race_list search
             url = (
-                f"{NETKEIBA_DB_URL}/?pid=race_list"
+                f"{DB_BASE}/?pid=race_list"
                 f"&start_year={year}&end_year={year}"
                 f"&grade%5B%5D={grade_code}"
                 f"&sort=date&list=100&page={page}"
             )
-            soup = _fetch(url)
+            soup = _fetch(url, use_cache=False)  # Don't cache search results
+
+            # Find race links - try multiple patterns
             links = soup.select("a[href*='/race/']")
-            if not links:
-                break
+            found = 0
             for a_tag in links:
                 href = a_tag.get("href", "")
                 match = re.search(r"/race/(\d{12})", href)
@@ -182,117 +160,152 @@ def scrape_grade_race_list_by_search(year: int) -> list[str]:
                     rid = match.group(1)
                     if rid not in race_ids:
                         race_ids.append(rid)
+                        found += 1
+
+            if found == 0:
+                break
+
             # Check for next page
-            next_link = soup.select_one("a.nk_pager_next")
-            if not next_link:
+            pager = soup.select("a[href*='page=']")
+            has_next = any(f"page={page + 1}" in a.get("href", "") for a in pager)
+            if not has_next:
                 break
             page += 1
+
+    logger.info(f"Found {len(race_ids)} grade races for {year}")
     return race_ids
 
 
 # ---------------------------------------------------------------------------
-# Race result scraping
+# Race result scraping: db.netkeiba.com/race/{race_id}/
 # ---------------------------------------------------------------------------
 
-
 def scrape_race_result(race_id: str) -> dict | None:
-    """Scrape full race result page.
+    """Scrape race result from db.netkeiba.com.
 
-    Returns:
-        Dict with keys: race_info (dict), results (list[dict]), payouts (list[dict])
-        or None if parsing fails.
+    Uses db.netkeiba.com/race/{race_id}/ which has the most stable HTML format.
     """
-    url = f"{NETKEIBA_BASE_URL}/race/result.html?race_id={race_id}"
+    url = f"{DB_BASE}/race/{race_id}/"
     soup = _fetch(url)
 
-    race_info = _parse_race_info(soup, race_id)
+    race_info = _parse_race_info_db(soup, race_id)
     if race_info is None:
-        return None
+        # Fallback: try race.netkeiba.com
+        url2 = f"{RACE_BASE}/race/result.html?race_id={race_id}"
+        soup = _fetch(url2)
+        race_info = _parse_race_info_db(soup, race_id)
+        if race_info is None:
+            return None
 
-    results = _parse_result_table(soup, race_id)
-    payouts = _parse_payout_table(soup, race_id)
+    results = _parse_result_table_db(soup, race_id)
+    payouts = _parse_payout_table_db(soup, race_id)
 
     return {"race_info": race_info, "results": results, "payouts": payouts}
 
 
-def _parse_race_info(soup: BeautifulSoup, race_id: str) -> dict | None:
-    """Parse race metadata from result page."""
-    # Race name
-    race_name_tag = soup.select_one("dl.racedata > dt")
-    if not race_name_tag:
-        return None
-    race_name = race_name_tag.get_text(strip=True)
+def _parse_race_info_db(soup: BeautifulSoup, race_id: str) -> dict | None:
+    """Parse race metadata. Tries multiple selector patterns."""
 
-    # Race details line: "芝右 2000m / 天候 : 晴 / 芝 : 良"
-    detail_tag = soup.select_one("dl.racedata > dd > p > diary_snap_cut > span")
-    if not detail_tag:
-        detail_tag = soup.select_one("dl.racedata > dd span")
+    # --- Race name ---
+    race_name = ""
+    for sel in [
+        "dl.racedata > dt",          # Classic db.netkeiba
+        "div.RaceName",               # New format
+        "h1.RaceName_main",           # Alternate new
+        "h1",                         # Last resort
+    ]:
+        tag = soup.select_one(sel)
+        if tag:
+            race_name = tag.get_text(strip=True)
+            if race_name:
+                break
+
+    if not race_name:
+        return None
+
+    # --- Race details (distance, surface, condition, weather) ---
+    detail_text = ""
+    for sel in [
+        "dl.racedata > dd",           # Classic
+        "div.RaceData01",             # New format
+        "div.RaceData",               # Alternate
+        "p.smalltxt",                 # Fallback
+        "diary_snap_cut span",        # Very old format
+    ]:
+        tag = soup.select_one(sel)
+        if tag:
+            detail_text = tag.get_text(separator=" ", strip=True)
+            if "m" in detail_text or "芝" in detail_text or "ダ" in detail_text:
+                break
 
     course_type = ""
     distance = 0
     track_condition = ""
     weather = ""
 
-    if detail_tag:
-        detail_text = detail_tag.get_text(strip=True)
-        # Parse course type and distance
+    if detail_text:
         m = re.search(r"(芝|ダ(?:ート)?|障).*?(\d{3,4})m", detail_text)
         if m:
             ct = m.group(1)
             course_type = "ダート" if ct.startswith("ダ") else ct
             distance = int(m.group(2))
-        # Weather
         m = re.search(r"天候\s*[:：]\s*(\S+)", detail_text)
         if m:
             weather = m.group(1)
-        # Track condition
-        m = re.search(r"(?:芝|ダート)\s*[:：]\s*(\S+)", detail_text)
+        m = re.search(r"(?:芝|ダート|ダ)\s*[:：]\s*(\S+)", detail_text)
         if m:
             track_condition = m.group(1)
 
-    # Race date from race_id: YYYYMMDDNNRR -> need to look at page
-    date_tag = soup.select_one("p.smalltxt, div.race_otherdata p")
+    # --- Race date ---
     race_date = None
-    if date_tag:
-        m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", date_tag.get_text())
-        if m:
+    # Try meta / text content
+    all_text = soup.get_text()
+    m = re.search(r"(\d{4})/(\d{1,2})/(\d{1,2})", all_text)
+    if m:
+        try:
             race_date = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
 
-    # Venue from race_id
-    venue_codes = {
-        "01": "札幌",
-        "02": "函館",
-        "03": "福島",
-        "04": "新潟",
-        "05": "東京",
-        "06": "中山",
-        "07": "中京",
-        "08": "京都",
-        "09": "阪神",
-        "10": "小倉",
-    }
+    # --- Venue from race_id ---
     venue_code = race_id[4:6]
-    venue = venue_codes.get(venue_code, "")
+    venue = VENUE_CODES.get(venue_code, "")
 
-    # Grade detection
+    # --- Grade detection ---
     grade = ""
-    grade_tag = soup.select_one("img[src*='icon_grade']")
+    # Method 1: icon image
+    grade_tag = soup.select_one("img[src*='icon_grade'], img[src*='ico_grade']")
     if grade_tag:
         src = grade_tag.get("src", "")
-        if "01" in src:
+        if "01" in src or "g1" in src.lower():
             grade = "G1"
-        elif "02" in src:
+        elif "02" in src or "g2" in src.lower():
             grade = "G2"
-        elif "03" in src:
+        elif "03" in src or "g3" in src.lower():
             grade = "G3"
+
+    # Method 2: class/span with grade info
     if not grade:
-        for text in [race_name]:
-            if "（G1）" in text or "(G1)" in text or "GI" in text:
+        for tag in soup.select("span.Icon_GradeType1, span[class*='Grade']"):
+            t = tag.get_text(strip=True)
+            if "G1" in t or "GI" == t:
                 grade = "G1"
-            elif "（G2）" in text or "(G2)" in text or "GII" in text:
+            elif "G2" in t or "GII" == t:
                 grade = "G2"
-            elif "（G3）" in text or "(G3)" in text or "GIII" in text:
+            elif "G3" in t or "GIII" == t:
                 grade = "G3"
+
+    # Method 3: text in race name or title
+    if not grade:
+        combined = race_name + " " + soup.title.get_text() if soup.title else race_name
+        for pattern, g in [
+            (r"\(G1\)|（G1）|GⅠ|\bGI\b", "G1"),
+            (r"\(G2\)|（G2）|GⅡ|\bGII\b", "G2"),
+            (r"\(G3\)|（G3）|GⅢ|\bGIII\b", "G3"),
+        ]:
+            if re.search(pattern, combined):
+                grade = g
+                break
 
     return {
         "race_id": race_id,
@@ -305,54 +318,115 @@ def _parse_race_info(soup: BeautifulSoup, race_id: str) -> dict | None:
         "weather": weather,
         "grade": grade,
         "race_class": "",
-        "head_count": 0,  # Updated after parsing results
+        "head_count": 0,
         "prize_1st": 0,
     }
 
 
-def _parse_result_table(soup: BeautifulSoup, race_id: str) -> list[dict]:
-    """Parse the result table rows."""
+def _parse_result_table_db(soup: BeautifulSoup, race_id: str) -> list[dict]:
+    """Parse race result table with multiple format support."""
     results = []
-    table = soup.select_one("table.race_table_01")
+
+    # Try multiple table selectors
+    table = None
+    for sel in [
+        "table.race_table_01",          # Classic db.netkeiba
+        "table.RaceTable01",             # Alternate
+        "table.Shutuba_Table",           # Race card
+        "table[class*='race_table']",    # Fuzzy match
+        "table[summary*='レース結果']",    # Summary attribute
+    ]:
+        table = soup.select_one(sel)
+        if table:
+            break
+
     if not table:
+        # Last resort: find the largest table
+        tables = soup.select("table")
+        if tables:
+            table = max(tables, key=lambda t: len(t.select("tr")))
+        else:
+            return results
+
+    rows = table.select("tr")
+    if len(rows) < 2:
         return results
 
-    rows = table.select("tr")[1:]  # Skip header
-    for row in rows:
+    # Detect header to understand column layout
+    header_row = rows[0]
+    headers = [th.get_text(strip=True) for th in header_row.select("th, td")]
+
+    # Build column index map
+    col_map = {}
+    for i, h in enumerate(headers):
+        h_clean = h.strip()
+        if h_clean in ("着順", "着\u3000順"):
+            col_map["finish"] = i
+        elif h_clean in ("枠番", "枠"):
+            col_map["frame"] = i
+        elif h_clean in ("馬番", "馬\u3000番"):
+            col_map["number"] = i
+        elif h_clean in ("馬名",):
+            col_map["name"] = i
+        elif h_clean in ("性齢",):
+            col_map["sex_age"] = i
+        elif h_clean in ("斤量", "負担重量"):
+            col_map["weight_carried"] = i
+        elif h_clean in ("騎手",):
+            col_map["jockey"] = i
+        elif h_clean in ("タイム", "走破タイム"):
+            col_map["time"] = i
+        elif h_clean in ("着差",):
+            col_map["margin"] = i
+        elif h_clean in ("通過", "通過順位"):
+            col_map["passing"] = i
+        elif h_clean in ("上り", "上がり", "上がり3F"):
+            col_map["last3f"] = i
+        elif h_clean in ("単勝", "単勝オッズ", "オッズ"):
+            col_map["odds"] = i
+        elif h_clean in ("人気", "人\u3000気"):
+            col_map["popularity"] = i
+        elif h_clean in ("馬体重",):
+            col_map["horse_weight"] = i
+        elif h_clean in ("調教師",):
+            col_map["trainer"] = i
+
+    # Fallback: if no headers detected, use classic db.netkeiba layout
+    if not col_map:
+        col_map = {
+            "finish": 0, "frame": 1, "number": 2, "name": 3,
+            "sex_age": 4, "weight_carried": 5, "jockey": 6,
+            "time": 7, "margin": 8, "passing": 10, "last3f": 11,
+            "trainer": 12, "odds": 12, "popularity": 13, "horse_weight": 14,
+        }
+
+    for row in rows[1:]:
         cols = row.select("td")
-        if len(cols) < 13:
+        if len(cols) < 5:
             continue
 
-        # Extract horse_id from link
-        horse_link = cols[3].select_one("a[href*='horse']")
-        horse_id = ""
-        if horse_link:
-            m = re.search(r"/horse/(\w+)", horse_link.get("href", ""))
-            if m:
-                horse_id = m.group(1)
+        def _get(key, default=""):
+            idx = col_map.get(key)
+            if idx is not None and idx < len(cols):
+                return cols[idx].get_text(strip=True)
+            return default
 
-        # Extract jockey_id
-        jockey_link = cols[6].select_one("a[href*='jockey']")
-        jockey_id = ""
-        if jockey_link:
-            m = re.search(r"/jockey/(?:result/recent/)?(\w+)", jockey_link.get("href", ""))
-            if m:
-                jockey_id = m.group(1)
+        def _get_link(key, pattern):
+            idx = col_map.get(key)
+            if idx is not None and idx < len(cols):
+                link = cols[idx].select_one(f"a[href*='{pattern}']")
+                if link:
+                    m = re.search(rf"/{pattern}/(?:result/recent/)?(\w+)", link.get("href", ""))
+                    if m:
+                        return m.group(1)
+            return ""
 
-        # Extract trainer_id
-        trainer_link = cols[12].select_one("a[href*='trainer']")
-        trainer_id = ""
-        if trainer_link:
-            m = re.search(r"/trainer/(?:result/recent/)?(\w+)", trainer_link.get("href", ""))
-            if m:
-                trainer_id = m.group(1)
+        # Finish order
+        finish_text = _get("finish")
+        finish_order = _safe_int(finish_text) if finish_text and finish_text[0].isdigit() else 0
 
-        # Parse finish order (handle 取消, 除外, 中止)
-        finish_text = cols[0].get_text(strip=True)
-        finish_order = _safe_int(finish_text) if finish_text.isdigit() else 0
-
-        # Horse weight and change: "480(+2)" or "480(-4)"
-        weight_text = cols[14].get_text(strip=True) if len(cols) > 14 else ""
+        # Horse weight and change
+        weight_text = _get("horse_weight")
         horse_weight = None
         weight_change = None
         wm = re.match(r"(\d+)\(([+\-]?\d+)\)", weight_text)
@@ -362,51 +436,52 @@ def _parse_result_table(soup: BeautifulSoup, race_id: str) -> list[dict]:
 
         result = {
             "race_id": race_id,
-            "horse_id": horse_id,
+            "horse_id": _get_link("name", "horse"),
             "finish_order": finish_order,
-            "frame_number": _safe_int(cols[1].get_text(strip=True)),
-            "horse_number": _safe_int(cols[2].get_text(strip=True)),
-            "horse_name": cols[3].get_text(strip=True),
-            "sex_age": cols[4].get_text(strip=True),
-            "weight_carried": _safe_float(cols[5].get_text(strip=True)),
-            "jockey_id": jockey_id,
-            "jockey_name": cols[6].get_text(strip=True),
-            "trainer_id": trainer_id,
-            "trainer_name": cols[12].get_text(strip=True) if len(cols) > 12 else "",
-            "finish_time": _parse_time_to_seconds(cols[7].get_text(strip=True)),
-            "margin": cols[8].get_text(strip=True) if len(cols) > 8 else "",
-            "passing_order": cols[10].get_text(strip=True) if len(cols) > 10 else "",
-            "last_3f": _safe_float(cols[11].get_text(strip=True)) if len(cols) > 11 else None,
+            "frame_number": _safe_int(_get("frame")),
+            "horse_number": _safe_int(_get("number")),
+            "horse_name": _get("name"),
+            "sex_age": _get("sex_age"),
+            "weight_carried": _safe_float(_get("weight_carried")),
+            "jockey_id": _get_link("jockey", "jockey"),
+            "jockey_name": _get("jockey"),
+            "trainer_id": _get_link("trainer", "trainer"),
+            "trainer_name": _get("trainer"),
+            "finish_time": _parse_time_to_seconds(_get("time")),
+            "margin": _get("margin"),
+            "passing_order": _get("passing"),
+            "last_3f": _safe_float(_get("last3f")),
             "horse_weight": horse_weight,
             "weight_change": weight_change,
-            "odds": _safe_float(cols[12].get_text(strip=True)) if len(cols) > 12 else None,
-            "popularity": _safe_int(cols[13].get_text(strip=True)) if len(cols) > 13 else None,
+            "odds": _safe_float(_get("odds")),
+            "popularity": _safe_int(_get("popularity")),
         }
-
-        # Odds and popularity are usually in the last columns
-        if len(cols) >= 18:
-            result["odds"] = _safe_float(cols[15].get_text(strip=True))
-            result["popularity"] = _safe_int(cols[16].get_text(strip=True))
 
         results.append(result)
 
     return results
 
 
-def _parse_payout_table(soup: BeautifulSoup, race_id: str) -> list[dict]:
-    """Parse the payout (払戻) table."""
+def _parse_payout_table_db(soup: BeautifulSoup, race_id: str) -> list[dict]:
+    """Parse payout table with multiple format support."""
     payouts = []
-    payout_tables = soup.select("table.pay_table_01")
+
+    # Find payout tables
+    payout_tables = soup.select("table.pay_table_01, table.Payout_Table, table[class*='pay']")
+    if not payout_tables:
+        # Try finding by content
+        for table in soup.select("table"):
+            text = table.get_text()
+            if "単勝" in text and ("払戻" in text or "配当" in text or any(
+                c.isdigit() for c in text[:100]
+            )):
+                payout_tables.append(table)
+                break
 
     bet_type_map = {
-        "単勝": "単勝",
-        "複勝": "複勝",
-        "枠連": "枠連",
-        "馬連": "馬連",
-        "ワイド": "ワイド",
-        "馬単": "馬単",
-        "三連複": "三連複",
-        "三連単": "三連単",
+        "単勝": "単勝", "複勝": "複勝", "枠連": "枠連",
+        "馬連": "馬連", "ワイド": "ワイド", "馬単": "馬単",
+        "三連複": "三連複", "三連単": "三連単",
     }
 
     for table in payout_tables:
@@ -424,7 +499,6 @@ def _parse_payout_table(soup: BeautifulSoup, race_id: str) -> list[dict]:
             if len(cols) < 2:
                 continue
 
-            # Combination and payout can have multiple values (e.g., 複勝 has 3 rows)
             combo_texts = cols[0].get_text(separator="\n").strip().split("\n")
             payout_texts = cols[1].get_text(separator="\n").strip().split("\n")
             pop_texts = (
@@ -433,115 +507,104 @@ def _parse_payout_table(soup: BeautifulSoup, race_id: str) -> list[dict]:
 
             for i, (combo, pay) in enumerate(zip(combo_texts, payout_texts)):
                 combo = combo.strip().replace(" ", "").replace("\u3000", "")
-                combo = re.sub(r"[→ー−]+", "-", combo)
+                combo = re.sub(r"[→ー−－]+", "-", combo)
                 pay_val = _safe_int(pay.replace(",", ""))
                 pop_val = _safe_int(pop_texts[i]) if i < len(pop_texts) else None
 
                 if combo and pay_val is not None:
-                    payouts.append(
-                        {
-                            "race_id": race_id,
-                            "bet_type": bet_type,
-                            "combination": combo,
-                            "payout": pay_val,
-                            "popularity": pop_val,
-                        }
-                    )
+                    payouts.append({
+                        "race_id": race_id,
+                        "bet_type": bet_type,
+                        "combination": combo,
+                        "payout": pay_val,
+                        "popularity": pop_val,
+                    })
 
     return payouts
 
 
 # ---------------------------------------------------------------------------
-# Horse profile scraping
+# Horse profile
 # ---------------------------------------------------------------------------
 
-
 def scrape_horse_profile(horse_id: str) -> dict | None:
-    """Scrape horse profile and pedigree info.
-
-    Returns:
-        Dict with horse info or None if not found.
-    """
-    url = f"{NETKEIBA_DB_URL}/horse/{horse_id}"
+    """Scrape horse profile from db.netkeiba.com."""
+    url = f"{DB_BASE}/horse/{horse_id}"
     soup = _fetch(url)
 
-    name_tag = soup.select_one("div.horse_title h1")
-    if not name_tag:
+    # Find horse name - multiple patterns
+    horse_name = ""
+    for sel in ["div.horse_title h1", "h1.Horse_Name", "h1"]:
+        tag = soup.select_one(sel)
+        if tag:
+            horse_name = tag.get_text(strip=True)
+            if horse_name:
+                break
+
+    if not horse_name:
         return None
 
-    horse_name = name_tag.get_text(strip=True)
-
-    # Profile table
     profile = {
         "horse_id": horse_id,
         "horse_name": horse_name,
         "birth_date": None,
         "sex": "",
-        "sire_id": "",
-        "sire_name": "",
-        "dam_id": "",
-        "dam_name": "",
-        "broodmare_sire_id": "",
-        "broodmare_sire_name": "",
-        "owner": "",
-        "breeder": "",
+        "sire_id": "", "sire_name": "",
+        "dam_id": "", "dam_name": "",
+        "broodmare_sire_id": "", "broodmare_sire_name": "",
+        "owner": "", "breeder": "",
     }
 
-    # Parse profile table
-    for row in soup.select("table.db_prof_table tr"):
+    # Profile table
+    for row in soup.select("table.db_prof_table tr, table.Horse_Profile tr"):
         th = row.select_one("th")
         td = row.select_one("td")
         if not th or not td:
             continue
         label = th.get_text(strip=True)
-        if label == "生年月日":
+        if "生年月日" in label:
             m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", td.get_text())
             if m:
                 profile["birth_date"] = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        elif label == "性別":
-            profile["sex"] = td.get_text(strip=True)
-        elif label == "馬主":
+        elif "性別" in label or "性齢" in label:
+            profile["sex"] = td.get_text(strip=True)[:1]
+        elif "馬主" in label:
             profile["owner"] = td.get_text(strip=True)
-        elif label == "生産者":
+        elif "生産者" in label:
             profile["breeder"] = td.get_text(strip=True)
 
     # Pedigree table
-    pedigree_table = soup.select_one("table.blood_table")
-    if pedigree_table:
-        links = pedigree_table.select("a[href*='/horse/']")
-        # Typically: sire, sire's sire, sire's dam, dam, dam's sire (BMS), dam's dam
-        pedigree_links = []
-        for link in links:
-            href = link.get("href", "")
-            m = re.search(r"/horse/(\w+)", href)
-            if m:
-                pedigree_links.append((m.group(1), link.get_text(strip=True)))
+    for sel in ["table.blood_table", "table[class*='blood']", "table[class*='Pedigree']"]:
+        ped_table = soup.select_one(sel)
+        if ped_table:
+            links = ped_table.select("a[href*='/horse/']")
+            ped_links = []
+            for link in links:
+                href = link.get("href", "")
+                m = re.search(r"/horse/(\w+)", href)
+                if m:
+                    ped_links.append((m.group(1), link.get_text(strip=True)))
 
-        if len(pedigree_links) >= 1:
-            profile["sire_id"] = pedigree_links[0][0]
-            profile["sire_name"] = pedigree_links[0][1]
-        if len(pedigree_links) >= 4:
-            profile["dam_id"] = pedigree_links[3][0]
-            profile["dam_name"] = pedigree_links[3][1]
-        if len(pedigree_links) >= 5:
-            profile["broodmare_sire_id"] = pedigree_links[4][0]
-            profile["broodmare_sire_name"] = pedigree_links[4][1]
+            if len(ped_links) >= 1:
+                profile["sire_id"] = ped_links[0][0]
+                profile["sire_name"] = ped_links[0][1]
+            if len(ped_links) >= 4:
+                profile["dam_id"] = ped_links[3][0]
+                profile["dam_name"] = ped_links[3][1]
+            if len(ped_links) >= 5:
+                profile["broodmare_sire_id"] = ped_links[4][0]
+                profile["broodmare_sire_name"] = ped_links[4][1]
+            break
 
     return profile
 
 
 # ---------------------------------------------------------------------------
-# Persistence helpers
+# Persistence
 # ---------------------------------------------------------------------------
 
-
 def save_race_data(data: dict, session=None) -> None:
-    """Save scraped race data to database.
-
-    Args:
-        data: Result from scrape_race_result()
-        session: Optional SQLAlchemy session (created if not provided)
-    """
+    """Save scraped race data to database."""
     own_session = session is None
     if own_session:
         init_db()
@@ -551,10 +614,8 @@ def save_race_data(data: dict, session=None) -> None:
         race_info = data["race_info"]
         results = data["results"]
         payouts = data["payouts"]
-
         race_info["head_count"] = len(results)
 
-        # Upsert race
         existing_race = session.get(Race, race_info["race_id"])
         if existing_race:
             for k, v in race_info.items():
@@ -562,12 +623,10 @@ def save_race_data(data: dict, session=None) -> None:
         else:
             session.add(Race(**race_info))
 
-        # Delete existing results and re-insert
         session.query(RaceResult).filter_by(race_id=race_info["race_id"]).delete()
         for r in results:
             session.add(RaceResult(**r))
 
-        # Delete existing payouts and re-insert
         session.query(Payout).filter_by(race_id=race_info["race_id"]).delete()
         for p in payouts:
             session.add(Payout(**p))

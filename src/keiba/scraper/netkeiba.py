@@ -132,25 +132,26 @@ VENUE_CODES = {
 # ---------------------------------------------------------------------------
 
 def scrape_grade_race_list_by_search(year: int) -> list[str]:
-    """Get grade race IDs using db.netkeiba.com search.
+    """Get grade race IDs for a given year.
 
-    Tries multiple URL patterns for robustness.
+    Strategy:
+    1. Try race.netkeiba.com top page date-based listing
+    2. Fall back to db.netkeiba.com search (may need login)
     """
     race_ids = []
 
-    for grade_code in [1, 2, 3]:  # G1, G2, G3
+    # Method 1: db.netkeiba.com search (works if not login-gated)
+    for grade_code in [1, 2, 3]:
         page = 1
         while True:
-            # Primary: pid=race_list search
             url = (
                 f"{DB_BASE}/?pid=race_list"
                 f"&start_year={year}&end_year={year}"
                 f"&grade%5B%5D={grade_code}"
                 f"&sort=date&list=100&page={page}"
             )
-            soup = _fetch(url, use_cache=False)  # Don't cache search results
+            soup = _fetch(url, use_cache=False)
 
-            # Find race links - try multiple patterns
             links = soup.select("a[href*='/race/']")
             found = 0
             for a_tag in links:
@@ -165,14 +166,42 @@ def scrape_grade_race_list_by_search(year: int) -> list[str]:
             if found == 0:
                 break
 
-            # Check for next page
             pager = soup.select("a[href*='page=']")
             has_next = any(f"page={page + 1}" in a.get("href", "") for a in pager)
             if not has_next:
                 break
             page += 1
 
-    logger.info(f"Found {len(race_ids)} grade races for {year}")
+    # Method 2: If db.netkeiba returned nothing, try race calendar
+    if not race_ids:
+        logger.info("db.netkeiba search returned no results, trying race calendar...")
+        import calendar
+
+        for month in range(1, 13):
+            _, last_day = calendar.monthrange(year, month)
+            # Scan each Saturday and Sunday (typical race days)
+            for day in range(1, last_day + 1):
+                d = date(year, month, day)
+                if d.weekday() not in (5, 6):  # Sat=5, Sun=6
+                    continue
+                if d > date.today():
+                    continue
+
+                date_str = d.strftime("%Y%m%d")
+                url = f"{RACE_BASE}/top/race_list.html?kaisai_date={date_str}"
+                try:
+                    soup = _fetch(url)
+                    for a_tag in soup.select("a[href*='/race/']"):
+                        href = a_tag.get("href", "")
+                        match = re.search(r"/race/(\d{12})", href)
+                        if match:
+                            rid = match.group(1)
+                            if rid not in race_ids:
+                                race_ids.append(rid)
+                except Exception:
+                    continue
+
+    logger.info(f"Found {len(race_ids)} races for {year}")
     return race_ids
 
 
@@ -181,23 +210,28 @@ def scrape_grade_race_list_by_search(year: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def scrape_race_result(race_id: str) -> dict | None:
-    """Scrape race result from db.netkeiba.com.
+    """Scrape race result page.
 
-    Uses db.netkeiba.com/race/{race_id}/ which has the most stable HTML format.
+    Tries race.netkeiba.com first (free, no login required),
+    then falls back to db.netkeiba.com (may need login).
     """
-    url = f"{DB_BASE}/race/{race_id}/"
+    # Primary: race.netkeiba.com (free access)
+    url = f"{RACE_BASE}/race/result.html?race_id={race_id}"
     soup = _fetch(url)
 
     race_info = _parse_race_info_db(soup, race_id)
-    if race_info is None:
-        # Fallback: try race.netkeiba.com
-        url2 = f"{RACE_BASE}/race/result.html?race_id={race_id}"
+    results = _parse_result_table_db(soup, race_id) if race_info else []
+
+    if not race_info or not results:
+        # Fallback: db.netkeiba.com
+        url2 = f"{DB_BASE}/race/{race_id}/"
         soup = _fetch(url2)
         race_info = _parse_race_info_db(soup, race_id)
-        if race_info is None:
-            return None
+        results = _parse_result_table_db(soup, race_id) if race_info else []
 
-    results = _parse_result_table_db(soup, race_id)
+    if not race_info or not results:
+        return None
+
     payouts = _parse_payout_table_db(soup, race_id)
 
     return {"race_info": race_info, "results": results, "payouts": payouts}

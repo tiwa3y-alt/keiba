@@ -75,43 +75,58 @@ def _cache_path(url: str) -> Path:
 
 
 def _fetch(url: str, use_cache: bool = True) -> BeautifulSoup:
-    """Fetch URL with rate limiting, retry, caching, and auto encoding."""
+    """Fetch URL with rate limiting, retry, caching, and auto encoding.
+
+    Uses curl for HTTP requests (more reliable cookie handling than requests library).
+    """
+    import subprocess
+
     if use_cache:
         cache = _cache_path(url)
         if cache.exists():
             html = cache.read_text(encoding="utf-8")
             return BeautifulSoup(html, "lxml")
 
-    # Build headers (avoid Session cookie jar interference)
-    headers = dict(_SESSION.headers)
-    if _COOKIE_STRING:
-        headers["Cookie"] = _COOKIE_STRING
-
     last_error = None
     for attempt in range(_MAX_RETRIES):
         try:
             time.sleep(REQUEST_INTERVAL_SEC)
-            # Use requests.get directly instead of Session to avoid cookie jar conflicts
-            resp = requests.get(url, headers=headers, timeout=30)
-            resp.raise_for_status()
 
-            # Auto-detect encoding
-            if resp.apparent_encoding:
-                resp.encoding = resp.apparent_encoding
-            elif "db.netkeiba" in url:
-                resp.encoding = "EUC-JP"
-            else:
-                resp.encoding = "UTF-8"
+            cmd = [
+                "curl", "-s", "-L", "--max-time", "30",
+                "-H", f"User-Agent: {_SESSION.headers['User-Agent']}",
+                "-H", "Accept-Language: ja,en-US;q=0.9,en;q=0.8",
+            ]
+            if _COOKIE_STRING:
+                cmd.extend(["-b", _COOKIE_STRING])
+            cmd.append(url)
 
-            html = resp.text
+            result = subprocess.run(cmd, capture_output=True, timeout=35)
+            if result.returncode != 0:
+                raise RuntimeError(f"curl exit code {result.returncode}")
 
-            if use_cache:
+            raw = result.stdout
+
+            # Detect encoding
+            html = ""
+            for encoding in ["utf-8", "euc-jp", "shift_jis"]:
+                try:
+                    html = raw.decode(encoding)
+                    if "html" in html.lower() or "レース" in html or "netkeiba" in html:
+                        break
+                except (UnicodeDecodeError, ValueError):
+                    continue
+
+            if not html:
+                html = raw.decode("utf-8", errors="replace")
+
+            if use_cache and html:
                 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 _cache_path(url).write_text(html, encoding="utf-8")
 
             return BeautifulSoup(html, "lxml")
 
-        except requests.RequestException as e:
+        except Exception as e:
             last_error = e
             wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
             logger.warning(f"Retry {attempt + 1}/{_MAX_RETRIES} for {url}: {e}")

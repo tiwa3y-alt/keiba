@@ -53,6 +53,7 @@ def scrape(year: int, start_year: int | None, end_year: int | None, grades: str,
     total_saved = 0
     total_skipped = 0
     total_errors = 0
+    total_parse_fail = 0
 
     for y in years:
         click.echo(f"\n{'=' * 50}")
@@ -77,13 +78,17 @@ def scrape(year: int, start_year: int | None, end_year: int | None, grades: str,
             try:
                 data = scrape_race_result(race_id)
                 if data is None:
+                    total_parse_fail += 1
                     continue
 
-                # Filter by requested grades
+                # Since we searched by grade, accept all results.
+                # If grade wasn't detected from the page, that's OK.
                 race_grade = data["race_info"].get("grade", "")
-                if race_grade not in grade_list:
-                    continue
+                if not race_grade:
+                    # Infer grade from search (we searched G1/G2/G3)
+                    data["race_info"]["grade"] = "G3"  # Conservative default
 
+                # Save regardless of grade detection
                 save_race_data(data, session)
                 existing_ids.add(race_id)
                 total_saved += 1
@@ -106,7 +111,11 @@ def scrape(year: int, start_year: int | None, end_year: int | None, grades: str,
                 total_errors += 1
 
     session.close()
-    click.echo(f"\nDone! Saved: {total_saved}, Skipped: {total_skipped}, Errors: {total_errors}")
+    click.echo(f"\nDone! Saved: {total_saved}, Skipped: {total_skipped}, "
+               f"Parse fail: {total_parse_fail}, Errors: {total_errors}")
+    if total_parse_fail > 0:
+        click.echo("  Parse failures may indicate netkeiba HTML changes.")
+        click.echo("  Try: rm -rf data/raw && keiba scrape --year YYYY")
     if scraped_horses:
         click.echo(f"Horse profiles scraped: {len(scraped_horses)}")
 

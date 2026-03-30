@@ -212,15 +212,24 @@ def _parse_race_info_db(soup: BeautifulSoup, race_id: str) -> dict | None:
         "dl.racedata > dt",          # Classic db.netkeiba
         "div.RaceName",               # New format
         "h1.RaceName_main",           # Alternate new
+        "div.data_intro h1",          # db.netkeiba 2024+
+        "div.data_intro dt",          # db.netkeiba variant
         "h1",                         # Last resort
     ]:
         tag = soup.select_one(sel)
         if tag:
             race_name = tag.get_text(strip=True)
-            if race_name:
+            if race_name and len(race_name) > 1:
                 break
 
+    # Fallback: try title tag
+    if not race_name and soup.title:
+        title = soup.title.get_text(strip=True)
+        # netkeiba titles are like "レース名 | netkeiba"
+        race_name = title.split("|")[0].strip()
+
     if not race_name:
+        logger.warning(f"Could not parse race name for {race_id}")
         return None
 
     # --- Race details (distance, surface, condition, weather) ---
@@ -331,20 +340,28 @@ def _parse_result_table_db(soup: BeautifulSoup, race_id: str) -> list[dict]:
     table = None
     for sel in [
         "table.race_table_01",          # Classic db.netkeiba
-        "table.RaceTable01",             # Alternate
+        "table.nk_tb_common",           # db.netkeiba 2024+
+        "table.RaceTable01",             # race.netkeiba new
         "table.Shutuba_Table",           # Race card
         "table[class*='race_table']",    # Fuzzy match
         "table[summary*='レース結果']",    # Summary attribute
+        "table[summary*='全着順']",       # Full results summary
     ]:
         table = soup.select_one(sel)
         if table:
             break
 
     if not table:
-        # Last resort: find the largest table
-        tables = soup.select("table")
-        if tables:
-            table = max(tables, key=lambda t: len(t.select("tr")))
+        # Last resort: find the table with most rows containing links to horses
+        best_table = None
+        best_count = 0
+        for t in soup.select("table"):
+            horse_links = t.select("a[href*='/horse/']")
+            if len(horse_links) > best_count:
+                best_count = len(horse_links)
+                best_table = t
+        if best_table and best_count >= 3:
+            table = best_table
         else:
             return results
 

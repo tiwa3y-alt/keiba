@@ -43,46 +43,30 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF = [2, 5, 10]
 
 
-def setup_session_cookies(cookie_string: str | None = None) -> None:
-    """Set up authentication cookies for netkeiba.com.
-
-    Args:
-        cookie_string: Cookie header value from browser.
-            Get it from: Chrome DevTools > Network tab > any netkeiba request >
-            Headers > Cookie. Copy the entire value.
-
-    If not provided, reads from NETKEIBA_COOKIE environment variable or
-    data/cookie.txt file.
-    """
+def _load_cookie_string() -> str:
+    """Load cookie string from file or environment."""
     import os
 
-    if not cookie_string:
-        cookie_string = os.environ.get("NETKEIBA_COOKIE", "")
-
+    cookie_string = os.environ.get("NETKEIBA_COOKIE", "")
     if not cookie_string:
         cookie_file = Path("data/cookie.txt")
         if cookie_file.exists():
             cookie_string = cookie_file.read_text().strip()
 
-    if not cookie_string:
+    if cookie_string:
+        logger.info(f"Loaded cookie ({len(cookie_string)} chars)")
+    else:
         logger.warning(
             "No netkeiba cookie found. Set NETKEIBA_COOKIE env var "
             "or create data/cookie.txt. See README for instructions."
         )
-        return
-
-    # Parse "key1=val1; key2=val2; ..." format
-    for pair in cookie_string.split(";"):
-        pair = pair.strip()
-        if "=" in pair:
-            key, val = pair.split("=", 1)
-            _SESSION.cookies.set(key.strip(), val.strip(), domain=".netkeiba.com")
-
-    logger.info(f"Loaded {len(_SESSION.cookies)} cookies for netkeiba.com")
+    return cookie_string
 
 
-# Auto-load cookies on module import
-setup_session_cookies()
+# Load cookie as raw header (more reliable than parsing into individual cookies)
+_COOKIE_STRING = _load_cookie_string()
+if _COOKIE_STRING:
+    _SESSION.headers["Cookie"] = _COOKIE_STRING
 
 
 def _cache_path(url: str) -> Path:

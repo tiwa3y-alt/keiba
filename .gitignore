@@ -1,0 +1,59 @@
+# Environment variables / Secrets
+.env
+.env.*
+!.env.example
+
+# API keys and credentials
+*.pem
+*.key
+credentials.json
+secrets.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Data files (large datasets)
+data/raw/
+data/external/
+*.csv
+*.parquet
+*.h5
+*.hdf5
+*.pickle
+*.pkl
+!data/.gitkeep
+
+# Model files
+models/*.joblib
+models/*.pkl
+models/*.h5
+models/*.pt
+models/*.onnx
+!models/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log

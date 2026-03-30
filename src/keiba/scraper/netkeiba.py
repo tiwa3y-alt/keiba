@@ -35,11 +35,54 @@ _SESSION.headers.update(
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 )
 
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = [2, 5, 10]
+
+
+def setup_session_cookies(cookie_string: str | None = None) -> None:
+    """Set up authentication cookies for netkeiba.com.
+
+    Args:
+        cookie_string: Cookie header value from browser.
+            Get it from: Chrome DevTools > Network tab > any netkeiba request >
+            Headers > Cookie. Copy the entire value.
+
+    If not provided, reads from NETKEIBA_COOKIE environment variable or
+    data/cookie.txt file.
+    """
+    import os
+
+    if not cookie_string:
+        cookie_string = os.environ.get("NETKEIBA_COOKIE", "")
+
+    if not cookie_string:
+        cookie_file = Path("data/cookie.txt")
+        if cookie_file.exists():
+            cookie_string = cookie_file.read_text().strip()
+
+    if not cookie_string:
+        logger.warning(
+            "No netkeiba cookie found. Set NETKEIBA_COOKIE env var "
+            "or create data/cookie.txt. See README for instructions."
+        )
+        return
+
+    # Parse "key1=val1; key2=val2; ..." format
+    for pair in cookie_string.split(";"):
+        pair = pair.strip()
+        if "=" in pair:
+            key, val = pair.split("=", 1)
+            _SESSION.cookies.set(key.strip(), val.strip(), domain=".netkeiba.com")
+
+    logger.info(f"Loaded {len(_SESSION.cookies)} cookies for netkeiba.com")
+
+
+# Auto-load cookies on module import
+setup_session_cookies()
 
 
 def _cache_path(url: str) -> Path:

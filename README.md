@@ -25,11 +25,41 @@ source .venv/bin/activate   # Mac/Linux
 pip install -e ".[dev]"
 ```
 
-### 3. 環境変数の設定
+### 3. netkeibaの認証Cookie設定（必須）
+
+netkeiba.comはログインしないとレース結果を閲覧できません。ブラウザのCookieをコピーして設定します。
+
+**手順:**
+
+1. ブラウザで [netkeiba.com](https://www.netkeiba.com/) にログイン（無料会員でOK）
+2. 任意のレース結果ページを開く
+3. Cookieを取得:
+   - **Chrome**: F12 → Network タブ → ページをリロード → 一番上のリクエストをクリック → Headers → `Cookie:` の値をコピー
+   - **Safari**: 開発メニュー → Webインスペクタ → ネットワーク → Cookie値をコピー
+4. コピーした値を `data/cookie.txt` に保存:
 
 ```bash
-cp .env.example .env
-# .env を編集（現時点では特に設定不要）
+mkdir -p data
+echo "ここにCookieの値をペースト" > data/cookie.txt
+```
+
+または環境変数で設定:
+
+```bash
+export NETKEIBA_COOKIE="nkauth=xxxxx; nk_session=yyyyy; ..."
+```
+
+**確認方法:**
+
+```bash
+python3 -c "
+from keiba.scraper.netkeiba import _fetch
+soup = _fetch('https://race.netkeiba.com/race/result.html?race_id=202409050811', use_cache=False)
+print('Title:', soup.title.get_text() if soup.title else 'NONE')
+tables = soup.select('table')
+print('Tables:', len(tables))
+# 10以上のテーブルが見つかれば成功
+"
 ```
 
 ## 使い方

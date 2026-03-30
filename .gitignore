@@ -42,6 +42,7 @@ data/external/
 # Model files
 models/*.joblib
 models/*.pkl
+models/*.txt
 models/*.h5
 models/*.pt
 models/*.onnx
@@ -56,6 +57,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Reports (generated)
+reports/
 
 # Logs
 logs/

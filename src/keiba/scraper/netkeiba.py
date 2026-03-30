@@ -112,7 +112,12 @@ _CONTEXT = None
 
 
 def _get_browser_context():
-    """Get or create a persistent Playwright browser context with cookies."""
+    """Get or create a persistent Playwright browser context.
+
+    Loads saved browser state from data/browser_state/state.json
+    (created by scripts/netkeiba_login.py).
+    Falls back to cookie string if no saved state exists.
+    """
     global _BROWSER, _CONTEXT
     if _CONTEXT is not None:
         return _CONTEXT
@@ -122,28 +127,40 @@ def _get_browser_context():
     pw = sync_playwright().start()
     _BROWSER = pw.chromium.launch(headless=True)
 
-    # Set up context with cookies
-    _CONTEXT = _BROWSER.new_context(
-        user_agent=_SESSION.headers["User-Agent"],
-        locale="ja-JP",
-    )
+    # Try saved browser state first (most reliable)
+    state_file = Path("data/browser_state/state.json")
+    if state_file.exists():
+        _CONTEXT = _BROWSER.new_context(
+            storage_state=str(state_file),
+            locale="ja-JP",
+        )
+        logger.info(f"Loaded browser state from {state_file}")
+        return _CONTEXT
 
-    # Load cookies from cookie string
+    # Fallback: create context with cookie string
+    _CONTEXT = _BROWSER.new_context(locale="ja-JP")
+
     if _COOKIE_STRING:
         cookies = []
         for pair in _COOKIE_STRING.split(";"):
             pair = pair.strip()
             if "=" in pair:
                 key, val = pair.split("=", 1)
-                cookies.append({
-                    "name": key.strip(),
-                    "value": val.strip(),
-                    "domain": ".netkeiba.com",
-                    "path": "/",
-                })
+                for domain in [".netkeiba.com", "db.netkeiba.com", "race.netkeiba.com"]:
+                    cookies.append({
+                        "name": key.strip(),
+                        "value": val.strip(),
+                        "domain": domain,
+                        "path": "/",
+                    })
         if cookies:
             _CONTEXT.add_cookies(cookies)
-            logger.info(f"Loaded {len(cookies)} cookies into browser")
+            logger.info(f"Loaded cookies into browser")
+    else:
+        logger.warning(
+            "No browser state or cookies found. "
+            "Run: python scripts/netkeiba_login.py"
+        )
 
     return _CONTEXT
 

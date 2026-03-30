@@ -1,8 +1,11 @@
 """Scraper for netkeiba.com - race results, horse profiles, odds, and payouts."""
 
+import hashlib
+import logging
 import re
 import time
 from datetime import date
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
@@ -10,6 +13,11 @@ from bs4 import BeautifulSoup
 from keiba.config import NETKEIBA_BASE_URL, NETKEIBA_DB_URL, REQUEST_INTERVAL_SEC
 from keiba.db.connection import get_session, init_db
 from keiba.db.schema import Horse, OddsHistory, Payout, Race, RaceResult
+
+logger = logging.getLogger(__name__)
+
+# Raw HTML cache directory
+_CACHE_DIR = Path("data/raw")
 
 _SESSION = requests.Session()
 _SESSION.headers.update(
@@ -21,30 +29,85 @@ _SESSION.headers.update(
     }
 )
 
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = [2, 5, 10]
 
-def _fetch(url: str) -> BeautifulSoup:
-    """Fetch a URL with rate limiting and return parsed HTML."""
-    time.sleep(REQUEST_INTERVAL_SEC)
-    resp = _SESSION.get(url, timeout=30)
-    resp.encoding = "EUC-JP"
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "lxml")
+
+def _cache_path(url: str) -> Path:
+    """Get cache file path for a URL."""
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    return _CACHE_DIR / f"{url_hash}.html"
+
+
+def _fetch(url: str, use_cache: bool = True) -> BeautifulSoup:
+    """Fetch a URL with rate limiting, retry, and caching.
+
+    Args:
+        url: URL to fetch.
+        use_cache: If True, check/store raw HTML cache.
+
+    Returns:
+        Parsed BeautifulSoup object.
+    """
+    # Check cache first
+    if use_cache:
+        cache = _cache_path(url)
+        if cache.exists():
+            html = cache.read_text(encoding="utf-8")
+            return BeautifulSoup(html, "lxml")
+
+    # Fetch with retry
+    last_error = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            time.sleep(REQUEST_INTERVAL_SEC)
+            resp = _SESSION.get(url, timeout=30)
+            resp.encoding = "EUC-JP"
+            resp.raise_for_status()
+
+            html = resp.text
+
+            # Save to cache
+            if use_cache:
+                _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                cache = _cache_path(url)
+                cache.write_text(html, encoding="utf-8")
+
+            return BeautifulSoup(html, "lxml")
+
+        except requests.RequestException as e:
+            last_error = e
+            wait = _RETRY_BACKOFF[attempt] if attempt < len(_RETRY_BACKOFF) else 10
+            logger.warning(f"Retry {attempt + 1}/{_MAX_RETRIES} for {url}: {e} (wait {wait}s)")
+            time.sleep(wait)
+
+    raise RuntimeError(f"Failed to fetch {url} after {_MAX_RETRIES} retries: {last_error}")
 
 
 def _parse_time_to_seconds(time_str: str) -> float | None:
-    """Convert "1:34.5" or "1.34.5" format to seconds."""
+    """Convert "1:34.5" or "1.34.5" format to seconds.
+
+    Examples:
+        "1:34.5" -> 94.5 (1 min 34.5 sec)
+        "1.34.5" -> 94.5 (netkeiba variant)
+        "34.5"   -> 34.5 (seconds only)
+    """
     if not time_str or time_str.strip() in ("", "-"):
         return None
-    time_str = time_str.strip().replace(".", ":", 1)
-    parts = time_str.split(":")
+    time_str = time_str.strip()
+    # Handle "M:SS.s" format
+    m = re.match(r"^(\d+):(\d+\.?\d*)$", time_str)
+    if m:
+        return float(m.group(1)) * 60 + float(m.group(2))
+    # Handle "M.SS.s" format (netkeiba uses this sometimes)
+    m = re.match(r"^(\d+)\.(\d{2}\.\d+)$", time_str)
+    if m:
+        return float(m.group(1)) * 60 + float(m.group(2))
+    # Handle seconds-only "SS.s"
     try:
-        if len(parts) == 2:
-            return float(parts[0]) * 60 + float(parts[1])
-        elif len(parts) == 1:
-            return float(parts[0])
+        return float(time_str)
     except ValueError:
         return None
-    return None
 
 
 def _safe_int(val: str) -> int | None:

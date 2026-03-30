@@ -15,11 +15,18 @@ def main():
 
 @main.command()
 @click.option("--year", required=True, type=int, help="Year to scrape")
+@click.option("--start-year", type=int, help="Start year for multi-year scrape")
+@click.option("--end-year", type=int, help="End year for multi-year scrape")
 @click.option("--grades", default="G1,G2,G3", help="Comma-separated grades (G1,G2,G3)")
 @click.option("--with-horses/--no-horses", default=True, help="Also scrape horse profiles")
-def scrape(year: int, grades: str, with_horses: bool):
-    """Scrape race data from netkeiba.com."""
+def scrape(year: int, start_year: int | None, end_year: int | None, grades: str, with_horses: bool):
+    """Scrape race data from netkeiba.com.
+
+    Use --year for a single year, or --start-year/--end-year for a range.
+    Already scraped races are skipped automatically (via HTML cache).
+    """
     from keiba.db.connection import init_db, get_session
+    from keiba.db.schema import Race
     from keiba.scraper.netkeiba import (
         scrape_grade_race_list_by_search,
         scrape_horse_profile,
@@ -31,44 +38,77 @@ def scrape(year: int, grades: str, with_horses: bool):
     init_db()
     grade_list = [g.strip() for g in grades.split(",")]
 
-    click.echo(f"Fetching grade race list for {year}...")
-    race_ids = scrape_grade_race_list_by_search(year)
-    click.echo(f"Found {len(race_ids)} races")
+    # Determine years to scrape
+    if start_year and end_year:
+        years = list(range(start_year, end_year + 1))
+    else:
+        years = [year]
 
     session = get_session()
+
+    # Load already scraped race IDs to skip
+    existing_ids = set(r[0] for r in session.query(Race.race_id).all())
     scraped_horses = set()
 
-    for race_id in tqdm(race_ids, desc="Scraping races"):
+    total_saved = 0
+    total_skipped = 0
+    total_errors = 0
+
+    for y in years:
+        click.echo(f"\n{'=' * 50}")
+        click.echo(f"Scraping {y} grade races ({', '.join(grade_list)})")
+        click.echo(f"{'=' * 50}")
+
         try:
-            data = scrape_race_result(race_id)
-            if data is None:
-                continue
-
-            # Filter by requested grades
-            race_grade = data["race_info"].get("grade", "")
-            if race_grade not in grade_list:
-                continue
-
-            save_race_data(data, session)
-
-            # Scrape horse profiles
-            if with_horses:
-                for result in data["results"]:
-                    horse_id = result.get("horse_id")
-                    if horse_id and horse_id not in scraped_horses:
-                        try:
-                            profile = scrape_horse_profile(horse_id)
-                            if profile:
-                                save_horse(profile, session)
-                            scraped_horses.add(horse_id)
-                        except Exception as e:
-                            click.echo(f"  Warning: Failed to scrape horse {horse_id}: {e}")
-
+            race_ids = scrape_grade_race_list_by_search(y)
         except Exception as e:
-            click.echo(f"  Error scraping {race_id}: {e}")
+            click.echo(f"  ERROR: Failed to fetch race list for {y}: {e}")
+            total_errors += 1
+            continue
+
+        click.echo(f"Found {len(race_ids)} candidate races")
+
+        for race_id in tqdm(race_ids, desc=f"  {y}"):
+            # Skip already scraped
+            if race_id in existing_ids:
+                total_skipped += 1
+                continue
+
+            try:
+                data = scrape_race_result(race_id)
+                if data is None:
+                    continue
+
+                # Filter by requested grades
+                race_grade = data["race_info"].get("grade", "")
+                if race_grade not in grade_list:
+                    continue
+
+                save_race_data(data, session)
+                existing_ids.add(race_id)
+                total_saved += 1
+
+                # Scrape horse profiles
+                if with_horses:
+                    for result in data["results"]:
+                        horse_id = result.get("horse_id")
+                        if horse_id and horse_id not in scraped_horses:
+                            try:
+                                profile = scrape_horse_profile(horse_id)
+                                if profile:
+                                    save_horse(profile, session)
+                                scraped_horses.add(horse_id)
+                            except Exception as e:
+                                click.echo(f"\n  Warning: horse {horse_id}: {e}")
+
+            except Exception as e:
+                click.echo(f"\n  Error: race {race_id}: {e}")
+                total_errors += 1
 
     session.close()
-    click.echo("Done!")
+    click.echo(f"\nDone! Saved: {total_saved}, Skipped: {total_skipped}, Errors: {total_errors}")
+    if scraped_horses:
+        click.echo(f"Horse profiles scraped: {len(scraped_horses)}")
 
 
 @main.command()
@@ -278,6 +318,103 @@ def predict(race_id: str):
             f"{row['predicted_prob']:>7.1%} "
             f"{row['raw_score']:>8.3f}"
         )
+
+
+@main.command()
+@click.option("--start-year", default=2016, type=int, help="First year of data")
+@click.option("--test-start", default=2021, type=int, help="First year for backtesting")
+@click.option("--test-end", default=2025, type=int, help="Last year for backtesting")
+@click.option(
+    "--bet-types",
+    default="単勝,馬連,三連複",
+    help="Comma-separated bet types",
+)
+@click.option("--ev-threshold", default=1.3, type=float, help="EV threshold")
+def pipeline(start_year: int, test_start: int, test_end: int, bet_types: str, ev_threshold: float):
+    """Run full pipeline: scrape -> features -> train -> backtest.
+
+    This is the main command for end-to-end execution.
+    Requires data to be already scraped (run 'keiba scrape' first).
+    """
+    import sys
+    sys.path.insert(0, ".")
+
+    click.echo("Running full pipeline...")
+    click.echo(f"  Data: {start_year}-{test_end}")
+    click.echo(f"  Test: {test_start}-{test_end}")
+    click.echo(f"  Bet types: {bet_types}")
+    click.echo(f"  EV threshold: {ev_threshold}")
+
+    try:
+        from scripts.run_pipeline import main as pipeline_main
+        pipeline_main()
+    except ImportError:
+        click.echo("Running pipeline directly...")
+        # Inline pipeline execution
+        from keiba.db.connection import get_engine, init_db
+        init_db()
+
+        engine = get_engine()
+        race_count = pd.read_sql("SELECT COUNT(*) as n FROM races", engine).iloc[0]["n"]
+        if race_count == 0:
+            click.echo("No data in database. Run 'keiba scrape --year YYYY' first.")
+            return
+
+        click.echo(f"  Found {race_count} races in database")
+        click.echo("  Use 'python scripts/run_pipeline.py' for full pipeline execution.")
+
+
+@main.command()
+def status():
+    """Show current database and model status."""
+    from keiba.db.connection import get_engine, init_db
+
+    init_db()
+    engine = get_engine()
+
+    races = pd.read_sql("SELECT COUNT(*) as n FROM races", engine).iloc[0]["n"]
+    results = pd.read_sql("SELECT COUNT(*) as n FROM race_results", engine).iloc[0]["n"]
+    horses = pd.read_sql("SELECT COUNT(*) as n FROM horses", engine).iloc[0]["n"]
+    payouts = pd.read_sql("SELECT COUNT(*) as n FROM payouts", engine).iloc[0]["n"]
+
+    click.echo("\n=== Database Status ===")
+    click.echo(f"  Races:        {races:,}")
+    click.echo(f"  Results:      {results:,}")
+    click.echo(f"  Horses:       {horses:,}")
+    click.echo(f"  Payouts:      {payouts:,}")
+
+    if races > 0:
+        date_range = pd.read_sql(
+            "SELECT MIN(race_date) as min_d, MAX(race_date) as max_d FROM races", engine
+        )
+        click.echo(f"  Date range:   {date_range.iloc[0]['min_d']} ~ {date_range.iloc[0]['max_d']}")
+
+        grade_counts = pd.read_sql(
+            "SELECT grade, COUNT(*) as n FROM races GROUP BY grade ORDER BY grade", engine
+        )
+        for _, row in grade_counts.iterrows():
+            click.echo(f"    {row['grade']}: {int(row['n'])} races")
+
+    # Check for trained models
+    from keiba.config import MODELS_DIR
+    model_files = list(MODELS_DIR.glob("*.txt"))
+    click.echo(f"\n=== Models ===")
+    if model_files:
+        for mf in sorted(model_files):
+            click.echo(f"  {mf.name}")
+    else:
+        click.echo("  No trained models found")
+
+    # Check for feature file
+    from pathlib import Path
+    feat_path = Path("data/features.parquet")
+    if feat_path.exists():
+        size_mb = feat_path.stat().st_size / (1024 * 1024)
+        click.echo(f"\n=== Features ===")
+        click.echo(f"  {feat_path}: {size_mb:.1f} MB")
+    else:
+        click.echo(f"\n=== Features ===")
+        click.echo("  Not built yet (run 'keiba features')")
 
 
 if __name__ == "__main__":

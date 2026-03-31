@@ -32,9 +32,10 @@ def main():
         context = browser.new_context(locale="ja-JP")
         page = context.new_page()
 
-        # Navigate to netkeiba
-        page.goto("https://regist.netkeiba.com/account/?rf=header")
-        print("ブラウザが開きました。ログインしてください...")
+        # Navigate to netkeiba login page
+        page.goto("https://www.netkeiba.com/")
+        print("ブラウザが開きました。")
+        print("右上の「ログイン」ボタンからログインしてください...")
         print()
 
         input("ログイン完了後、ここで Enter を押してください >>> ")
